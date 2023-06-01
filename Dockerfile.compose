@@ -1,0 +1,105 @@
+
+#
+# Multistage build.
+#
+ARG TRITON_VERSION=2.25.0
+ARG TRITON_CONTAINER_VERSION=22.08
+
+FROM nvcr.io/nvidia/tritonserver:22.08-py3 AS full
+
+FROM nvcr.io/nvidia/tritonserver:22.08-py3-min
+
+ARG TRITON_VERSION
+ARG TRITON_CONTAINER_VERSION
+
+ENV TRITON_SERVER_VERSION ${TRITON_VERSION}
+ENV NVIDIA_TRITON_SERVER_VERSION ${TRITON_CONTAINER_VERSION}
+LABEL com.nvidia.tritonserver.version="${TRITON_SERVER_VERSION}"
+
+ENV PATH /opt/tritonserver/bin:${PATH}
+
+ENV TF_ADJUST_HUE_FUSED         1
+ENV TF_ADJUST_SATURATION_FUSED  1
+ENV TF_ENABLE_WINOGRAD_NONFUSED 1
+ENV TF_AUTOTUNE_THRESHOLD       2
+ENV TRITON_SERVER_GPU_ENABLED    1
+
+# Create a user that can be used to run triton as
+# non-root. Make sure that this user to given ID 1000. All server
+# artifacts copied below are assign to this user.
+ENV TRITON_SERVER_USER=triton-server
+RUN userdel tensorrt-server > /dev/null 2>&1 || true &&     if ! id -u $TRITON_SERVER_USER > /dev/null 2>&1 ; then         useradd $TRITON_SERVER_USER;     fi &&     [ `id -u $TRITON_SERVER_USER` -eq 1000 ] &&     [ `id -g $TRITON_SERVER_USER` -eq 1000 ]
+
+# Ensure apt-get won't prompt for selecting options
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Common dependencies. FIXME (can any of these be conditional? For
+# example libcurl only needed for GCS?)
+RUN apt-get update &&     apt-get install -y --no-install-recommends             software-properties-common             libb64-0d             libcurl4-openssl-dev             libre2-5             git             dirmngr             libnuma-dev             curl              &&     rm -rf /var/lib/apt/lists/*
+
+ENV DCGM_VERSION 2.2.9
+# Install DCGM. Steps from https://developer.nvidia.com/dcgm#Downloads
+RUN curl -o /tmp/cuda-keyring.deb     https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.0-1_all.deb     && apt install /tmp/cuda-keyring.deb && rm /tmp/cuda-keyring.deb &&     apt-get update && apt-get install -y datacenter-gpu-manager=1:2.2.9
+
+# Install pip first
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pip && rm -rf /var/lib/apt/lists/*
+# Install gRPC python (v1.48.0)
+RUN python3 -m pip install --upgrade pip &&     python3 -m pip install grpcio==1.48.0 grpcio-tools==1.48.0
+
+# Copy python stub
+COPY --chown=1000:1000 ./scheduling.proto /root/scheduling.proto
+COPY --chown=1000:1000 ./register.py /root/register.py
+
+# Install python stub
+RUN python3 -m grpc_tools.protoc -I/root --python_out=/root --grpc_python_out=/root /root/scheduling.proto
+
+# Install necessary libs manually
+COPY --chown=1000:1000 ./lib/libmkl_intel_lp64.so.1 /lib/x86_64-linux-gnu/libmkl_intel_lp64.so.1
+COPY --chown=1000:1000 ./lib/libmkl_gnu_thread.so.1 /lib/x86_64-linux-gnu/libmkl_gnu_thread.so.1
+COPY --chown=1000:1000 ./lib/libmkl_core.so.1 /lib/x86_64-linux-gnu/libmkl_core.so.1
+COPY --chown=1000:1000 ./lib/libmpi_cxx.so.40.20.1 /opt/hpcx/ompi/lib/libmpi_cxx.so.40.20.1
+COPY --chown=1000:1000 ./lib/lib64/libcheckpoint.so /lib/x86_64-linux-gnu/libcheckpoint.so
+COPY --chown=1000:1000 ./lib/lib64/libcupti.so.2022.3.0 /lib/x86_64-linux-gnu/libcupti.so.2022.3.0
+COPY --chown=1000:1000 ./lib/lib64/libcupti_static.a /lib/x86_64-linux-gnu/libcupti_static.a
+COPY --chown=1000:1000 ./lib/lib64/libnvperf_host.so /lib/x86_64-linux-gnu/libnvperf_host.so
+COPY --chown=1000:1000 ./lib/lib64/libnvperf_host_static.a /lib/x86_64-linux-gnu/libnvperf_host_static.a
+COPY --chown=1000:1000 ./lib/lib64/libnvperf_target.so /lib/x86_64-linux-gnu/libnvperf_target.so
+COPY --chown=1000:1000 ./lib/lib64/libpcsamplingutil.so /lib/x86_64-linux-gnu/libpcsamplingutil.so
+# make a link to the libmpi_cxx.so.40.20.1
+RUN ln -s /opt/hpcx/ompi/lib/libmpi_cxx.so.40.20.1 /lib/x86_64-linux-gnu/libmpi_cxx.so.40
+# make a link to the libcupti.so.2022.3.0
+# RUN ln -s /lib/x86_64-linux-gnu/libcupti.so.2022.3.0 /lib/x86_64-linux-gnu/libcupti.so.11.8
+# RUN ln -s /lib/x86_64-linux-gnu/libcupti.so.11.8 /lib/x86_64-linux-gnu/libcupti.so
+RUN ldconfig
+
+
+# Extra defensive wiring for CUDA Compat lib
+RUN ln -sf ${_CUDA_COMPAT_PATH}/lib.real ${_CUDA_COMPAT_PATH}/lib  && echo ${_CUDA_COMPAT_PATH}/lib > /etc/ld.so.conf.d/00-cuda-compat.conf  && ldconfig  && rm -f ${_CUDA_COMPAT_PATH}/lib
+
+WORKDIR /opt/tritonserver
+RUN rm -fr /opt/tritonserver/*
+ENV NVIDIA_PRODUCT_NAME="Triton Server"
+COPY docker/entrypoint.d/ /opt/nvidia/entrypoint.d/
+
+ENV NVIDIA_BUILD_ID 42766143
+LABEL com.nvidia.build.id=42766143
+LABEL com.nvidia.build.ref=6f0d3d35680e533347ee4d92e9e74a36e9b4e7a3
+
+WORKDIR /opt/tritonserver
+COPY --chown=1000:1000 --from=full /opt/tritonserver/LICENSE .
+COPY --chown=1000:1000 --from=full /opt/tritonserver/TRITON_VERSION .
+COPY --chown=1000:1000 --from=full /opt/tritonserver/NVIDIA_Deep_Learning_Container_License.pdf .
+COPY --chown=1000:1000 --from=full /opt/tritonserver/bin bin/
+COPY --chown=1000:1000 --from=full /opt/tritonserver/lib lib/
+COPY --chown=1000:1000 --from=full /opt/tritonserver/include include/
+# Copying over backends 
+COPY --chown=1000:1000 --from=full /opt/tritonserver/backends backends/
+#  Copying over repoagents 
+
+LABEL com.amazonaws.sagemaker.capabilities.accept-bind-to-port=true
+COPY --chown=1000:1000 --from=full /usr/bin/serve /usr/bin/.
+
+# Copy local developed libtritonserver.so
+COPY --chown=1000:1000 ./libtritonserver.so /opt/tritonserver/lib/libtritonserver.so
+# Copy local pytorch backend
+COPY --chown=1000:1000 ./pytorch /opt/tritonserver/backends/pytorch
